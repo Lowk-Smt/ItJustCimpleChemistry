@@ -1,0 +1,1189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Stick Fight — Prototype</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #05060a;
+    overflow: hidden;
+  }
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  /* Internal resolution is fixed at 960x540; CSS only scales the element. */
+  #game {
+    display: block;
+    width: 960px;
+    max-width: 100vw;
+    max-height: 100vh;
+    height: auto;
+    aspect-ratio: 16 / 9;
+    border-radius: 8px;
+    box-shadow: 0 20px 80px rgba(0, 0, 0, 0.9), 0 0 0 1px rgba(255, 255, 255, 0.06);
+    background: #0a0c14;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+
+<script>
+"use strict";
+/* ============================================================================
+ * STICK FIGHT — single file prototype
+ * ----------------------------------------------------------------------------
+ * Sections (kept deliberately modular so this can be split into
+ * config.js / input.js / physics.js / fighter.js / render.js / ui.js / main.js
+ * when it moves to a Node server + phone-controller setup):
+ *
+ *   ==== CONFIG ====      tunable numbers, stage layout, control maps
+ *   ==== INPUT ====       keyboard state + edge detection (+ injection hook)
+ *   ==== PHYSICS ====     pure helpers: gravity, one-way platforms, AABB overlap
+ *   ==== FIGHTER ====     fighter state machine: move, jump, attack, hit, KO
+ *   ==== RENDER ====      procedural stick-man drawing, stage, particles
+ *   ==== GAME LOOP ====    fixed 60Hz update + render pump
+ *   ==== UI ====          HUD, stock meters, hints, game over screen
+ *   ==== DEBUG HOOK ====   test/automation surface (safe to delete)
+ * ========================================================================== */
+
+// ==== CONFIG ====
+// Every gameplay number lives here. Nothing below should contain magic numbers.
+const CONFIG = {
+  // --- canvas / stage ---
+  WIDTH: 960,
+  HEIGHT: 540,
+  GROUND_Y: 480,            // y of the flat ground line (feet rest here)
+  GROUND_X1: 0,             // visible extent of the ground line
+  GROUND_X2: 960,
+  STAGE_CLAMP: { left: 12, right: 948 },   // you can be LAUNCHED off screen, never walk off
+
+  // --- physics (units: pixels, frames @60Hz) ---
+  GRAVITY: 0.62,            // constant downward acceleration
+  FALL_MULTIPLIER: 1.18,    // falls a touch faster than it rises (snappy arcs)
+  MAX_FALL: 17,             // terminal velocity
+  MOVE_ACCEL: 1.15,         // ground acceleration
+  AIR_ACCEL: 0.72,          // air control acceleration
+  MAX_RUN: 4.7,             // top self-driven horizontal speed
+  EXCESS_DRAG: 0.90,        // sheds knockback speed above MAX_RUN once hitstun ends
+  GROUND_FRICTION: 0.72,    // strong friction => stops on a dime
+  AIR_DRAG: 0.94,           // weak drag in the air
+  LAUNCH_DRAG: 0.955,       // drag while knocked back (higher = flies further)
+  JUMP_VEL: -13.8,          // initial jump velocity (only when grounded)
+  JUMP_CUT: 0.45,           // short hop multiplier when jump is released early
+  DROP_FRAMES: 12,          // frames a droppable platform stays pass-through
+
+  // --- combat ---
+  ATTACK_ACTIVE: 6,         // hitbox lives for ~6 frames
+  ATTACK_COOLDOWN: 15,      // ~15 frames before the next swing
+  ATTACK_AUTOREPEAT: true,  // holding attack keeps swinging once cooled down
+  ATTACK_LUNGE: 1.3,        // small forward step-in on the swing
+  HITBOX: { reach: 40, offset: 8, top: 62, height: 32 },
+  HURTBOX: { halfWidth: 15, height: 70 },
+  DAMAGE_PER_HIT: 8,        // damage % added per clean hit
+  MAX_DAMAGE: 999,
+  KB_BASE: 4.5,             // knockback at 0% damage
+  KB_PER_DAMAGE: 0.19,      // knockback gained per damage % (higher % = flies further)
+  KB_MAX: 40,               // sanity clamp on knockback magnitude
+  KB_LIFT: 2.0,             // constant upward pop on hit
+  KB_LIFT_SCALE: 0.5,       // extra upward pop scaled by knockback
+  HITSTUN_BASE: 8,          // frames of lost control on hit
+  HITSTUN_PER_KB: 0.9,
+  HITSTUN_MAX: 46,
+  HIT_FLASH: 7,             // frames of white flash on the victim
+  HITSTOP_LIGHT: 2,         // freeze frames on a normal hit (impact feel)
+  HITSTOP_HEAVY: 5,         // freeze frames on a big hit
+  HITSTOP_HEAVY_KB: 18,     // knockback threshold for "heavy"
+
+  // --- stocks / respawns ---
+  STOCKS: 3,
+  RESPAWN_DELAY: 45,        // frames a KO'd fighter stays off stage
+  RESPAWN_INVULN: 90,       // frames of blink invulnerability after respawning
+
+  // --- blast zones (leave these => lose a stock) ---
+  // Set outside the visible canvas so a KO has to be earned: mid-stage KOs land
+  // around ~140-160% damage, hits near the edge connect much earlier.
+  BLAST: { left: -120, right: 1080, top: -240, bottom: 680 },
+
+  // --- render ---
+  // SCALE multiplies the whole stick-man (pose joints, hurtbox, hitbox, health
+  // bar) so proportions stay consistent when tuning the body size.
+  SCALE: 1.22,
+  BODY: { headR: 9, headW: 4, torsoW: 7, legW: 4.5, armW: 3.5 },
+  HEALTH_BAR: { width: 46, height: 5, offsetY: 80, max: 200 },
+  DAMAGE_TIERS: [
+    { at: 50,  bar: '#4ade80', text: '#e8fff0' },
+    { at: 100, bar: '#facc15', text: '#fff8dc' },
+    { at: 150, bar: '#fb923c', text: '#ffe9d6' },
+    { at: 999, bar: '#f43f5e', text: '#ffdde3' }
+  ],
+
+  // --- fighter skins ---
+  COLORS: {
+    p1: { main: '#ff4d5e', dark: '#b32d3c', glow: 'rgba(255,77,94,0.55)', name: 'P1' },
+    p2: { main: '#4da3ff', dark: '#2c62b3', glow: 'rgba(77,163,255,0.55)', name: 'P2' }
+  },
+
+  FONT: 'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif'
+};
+
+// Stage surfaces. `droppable` platforms are one-way (jump up through, land on top).
+const SURFACES = [
+  // The floor's collision span reaches out to the blast zones, so there is no
+  // invisible pit to walk into: the only way off the stage is to be launched.
+  { id: 'ground', x1: CONFIG.BLAST.left, x2: CONFIG.BLAST.right, y: CONFIG.GROUND_Y, droppable: false },
+  { id: 'plat-left',   x1: 150, x2: 330, y: 400, droppable: true },
+  { id: 'plat-center', x1: 380, x2: 580, y: 320, droppable: true },
+  { id: 'plat-right',  x1: 630, x2: 810, y: 400, droppable: true }
+];
+const PLATFORMS = SURFACES.filter((s) => s.droppable);
+
+// Key bindings use KeyboardEvent.code (layout independent).
+const CONTROLS = {
+  p1: { left: 'KeyA', right: 'KeyD', jump: 'KeyW', down: 'KeyS', attack: 'KeyF' },
+  p2: { left: 'ArrowLeft', right: 'ArrowRight', jump: 'ArrowUp', down: 'ArrowDown', attack: 'Slash' }
+};
+const RESTART_KEY = 'KeyR';
+
+// Spawn points (feet position on the ground).
+const SPAWNS = {
+  p1: { x: 360, y: CONFIG.GROUND_Y, facing: 1 },   // spawn in the gap under no platform
+  p2: { x: 600, y: CONFIG.GROUND_Y, facing: -1 }
+};
+
+const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+const TAU = Math.PI * 2;
+
+// ==== INPUT ====
+// Thin keyboard layer. `down` = held state, `pressed` = edge (cleared each tick).
+// `inject()` lets a test harness / future network controller feed the same
+// pipeline without a real keyboard event.
+const Input = {
+  down: Object.create(null),
+  pressed: Object.create(null),
+  handlers: [],
+
+  init() {
+    const onKeyDown = (e) => {
+      if (BLOCKED_DEFAULTS.has(e.code)) e.preventDefault();
+      if (e.repeat) return;                 // ignore OS key-repeat; we do our own
+      this.set(e.code, true);
+    };
+    const onKeyUp = (e) => {
+      if (BLOCKED_DEFAULTS.has(e.code)) e.preventDefault();
+      this.set(e.code, false);
+    };
+    const onBlur = () => { this.down = Object.create(null); this.pressed = Object.create(null); };
+
+    this.handlers = [
+      ['keydown', onKeyDown], ['keyup', onKeyUp], ['blur', onBlur]
+    ];
+    for (const [type, fn] of this.handlers) window.addEventListener(type, fn);
+  },
+
+  set(code, isDown) {
+    // The pressed edge survives a same-tick keyup so sub-frame taps are never
+    // swallowed; it is consumed by endFrame() at the end of each tick.
+    if (isDown && !this.down[code]) this.pressed[code] = true;
+    this.down[code] = isDown;
+  },
+
+  // Automation hook: same code path as a physical key.
+  inject(code, isDown) { this.set(code, isDown); },
+
+  isDown(code) { return !!this.down[code]; },
+  wasPressed(code) { return !!this.pressed[code]; },
+
+  // Called at the end of every simulation tick.
+  endFrame() { this.pressed = Object.create(null); }
+};
+
+const BLOCKED_DEFAULTS = new Set([
+  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Slash', 'KeyW', 'KeyA', 'KeyS', 'KeyD'
+]);
+
+// Reads the control map for one fighter into a normalized intent object.
+function readIntent(map) {
+  return {
+    left: Input.isDown(map.left),
+    right: Input.isDown(map.right),
+    jumpPressed: Input.wasPressed(map.jump),
+    jumpHeld: Input.isDown(map.jump),
+    downPressed: Input.wasPressed(map.down),
+    attackPressed: Input.wasPressed(map.attack),
+    attackHeld: Input.isDown(map.attack)
+  };
+}
+
+// ==== PHYSICS ====
+// Pure functions: no fighter state mutation except where documented.
+
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// One-way platform / ground resolution.
+// Lands only when falling and when the feet crossed the surface top this frame,
+// so fighters pass freely upward through platforms.
+function resolveSurfaceCollision(f) {
+  const wasGrounded = f.grounded;
+  f.grounded = false;
+  f.standingOn = null;
+
+  if (f.vy < 0) return wasGrounded;                 // rising: everything is pass-through
+  if (f.prevY > f.y + 1e-6) return wasGrounded;     // safety: never snap upward
+
+  const TOL = 10;                                   // feet may hang slightly off an edge
+  for (const s of SURFACES) {
+    if (s.droppable && f.dropTimer > 0) continue;   // dropping through for a few frames
+    if (f.x < s.x1 - TOL || f.x > s.x2 + TOL) continue;
+    if (f.prevY <= s.y + 0.001 && f.y >= s.y) {     // crossed the top from above
+      f.y = s.y;
+      f.vy = 0;
+      f.grounded = true;
+      f.standingOn = s;
+      break;
+    }
+  }
+  return wasGrounded;
+}
+
+// Applies gravity + terminal velocity.
+function applyGravity(f) {
+  f.vy += CONFIG.GRAVITY * (f.vy > 0 ? CONFIG.FALL_MULTIPLIER : 1);
+  if (f.vy > CONFIG.MAX_FALL) f.vy = CONFIG.MAX_FALL;
+}
+
+// Knockback magnitude for a defender at `damage` percent (after the hit lands).
+// This is the "higher damage = flies further" curve.
+function knockbackFor(damage) {
+  return Math.min(CONFIG.KB_MAX, CONFIG.KB_BASE + damage * CONFIG.KB_PER_DAMAGE);
+}
+
+// ==== FIGHTER ====
+
+function createFighter(key, controls, spawn, colors) {
+  return {
+    key, controls, colors,
+    spawnX: spawn.x, spawnY: spawn.y,
+    // transform
+    x: spawn.x, y: spawn.y, prevY: spawn.y,
+    vx: 0, vy: 0,
+    facing: spawn.facing,
+    // body half-extents (used by hurtbox + rendering)
+    // state
+    grounded: true, standingOn: null,
+    damage: 0, stocks: CONFIG.STOCKS, deaths: 0,
+    alive: true, respawnTimer: 0, invuln: 0,
+    // attack
+    attackTimer: 0, attackCooldown: 0, attackHit: false,
+    // reactions
+    hitstun: 0, hitFlash: 0, spin: 0,
+    // platform drop-through window
+    dropTimer: 0,
+    // variable jump height
+    jumpCut: false,
+    // animation
+    animTime: Math.random() * 40,
+    wasAirborne: false,
+    intent: { left: false, right: false, jumpPressed: false, jumpHeld: false, downPressed: false, attackPressed: false, attackHeld: false }
+  };
+}
+
+function resetFighter(f) {
+  f.x = f.spawnX; f.y = f.spawnY; f.prevY = f.spawnY;
+  f.vx = 0; f.vy = 0;
+  f.facing = f.key === 'p1' ? 1 : -1;
+  f.grounded = true; f.standingOn = SURFACES[0];
+  f.damage = 0; f.stocks = CONFIG.STOCKS; f.deaths = 0;
+  f.alive = true; f.respawnTimer = 0; f.invuln = 0;
+  f.attackTimer = 0; f.attackCooldown = 0; f.attackHit = false;
+  f.hitstun = 0; f.hitFlash = 0; f.spin = 0; f.dropTimer = 0; f.jumpCut = false;
+  f.wasAirborne = false;
+}
+
+// --- hitboxes ---------------------------------------------------------------
+function getHurtbox(f) {
+  const S = CONFIG.SCALE;
+  const hw = CONFIG.HURTBOX.halfWidth * S;
+  const h = CONFIG.HURTBOX.height * S;
+  return { x: f.x - hw, y: f.y - h, w: hw * 2, h };
+}
+
+function getHitbox(f) {
+  if (f.attackTimer <= 0 || !f.alive) return null;
+  const hb = CONFIG.HITBOX, S = CONFIG.SCALE;
+  const reach = hb.reach * S, offset = hb.offset * S, top = hb.top * S, height = hb.height * S;
+  const x = f.facing > 0 ? f.x + offset : f.x - offset - reach;
+  return { x, y: f.y - top, w: reach, h: height };
+}
+
+// --- actions ----------------------------------------------------------------
+function tryAttack(f) {
+  if (!f.alive || f.hitstun > 0 || f.attackTimer > 0 || f.attackCooldown > 0) return false;
+  f.attackTimer = CONFIG.ATTACK_ACTIVE;
+  f.attackHit = false;
+  f.vx += f.facing * CONFIG.ATTACK_LUNGE;      // small step-in for weight
+  return true;
+}
+
+function startDropThrough(f) {
+  if (!f.grounded || !f.standingOn || !f.standingOn.droppable) return false;
+  f.dropTimer = CONFIG.DROP_FRAMES;
+  f.grounded = false;
+  f.standingOn = null;
+  f.y += 1;                                     // break the surface contact test
+  f.vy = Math.max(f.vy, 1.2);
+  return true;
+}
+
+function doJump(f) {
+  if (!f.grounded) return false;
+  f.vy = CONFIG.JUMP_VEL;
+  f.grounded = false;
+  f.standingOn = null;
+  f.jumpCut = false;
+  spawnDust(f.x, f.y, 6, f.colors.glow);
+  return true;
+}
+
+// --- damage / knockback -----------------------------------------------------
+function applyHit(attacker, defender, hitbox) {
+  defender.damage = Math.min(CONFIG.MAX_DAMAGE, defender.damage + CONFIG.DAMAGE_PER_HIT);
+
+  const kb = knockbackFor(defender.damage);
+  const dir = attacker.facing;                  // knockback follows attacker facing
+
+  defender.vx = dir * kb;
+  defender.vy = -(CONFIG.KB_LIFT + kb * CONFIG.KB_LIFT_SCALE);
+  defender.hitstun = Math.round(clamp(CONFIG.HITSTUN_BASE + kb * CONFIG.HITSTUN_PER_KB, 6, CONFIG.HITSTUN_MAX));
+  defender.hitFlash = CONFIG.HIT_FLASH;
+  defender.grounded = false;
+  defender.standingOn = null;
+  defender.dropTimer = 0;
+  defender.jumpCut = true;
+  // interrupt whatever the defender was doing
+  defender.attackTimer = 0;
+  defender.attackHit = false;
+  defender.spin = 0;
+
+  attacker.hitsLanded = (attacker.hitsLanded || 0) + 1;
+
+  // juice
+  const cx = hitbox ? hitbox.x + hitbox.w * 0.5 : defender.x;
+  const cy = hitbox ? hitbox.y + hitbox.h * 0.5 : defender.y - 46;
+  spawnHitSparks(cx, cy, dir, kb, defender.colors.main);
+  state.shake = Math.min(18, 4 + kb * 0.45);
+  state.freeze = kb >= CONFIG.HITSTOP_HEAVY_KB ? CONFIG.HITSTOP_HEAVY : CONFIG.HITSTOP_LIGHT;
+}
+
+// --- KO / respawn -----------------------------------------------------------
+function killFighter(f) {
+  if (!f.alive) return;
+  f.alive = false;
+  f.stocks = Math.max(0, f.stocks - 1);
+  f.deaths++;
+  f.respawnTimer = CONFIG.RESPAWN_DELAY;
+  f.hitstun = 0;
+  f.attackTimer = 0;
+  spawnKoBurst(f);
+  state.shake = 20;
+  state.freeze = 0;
+
+  const other = fighters.find((o) => o !== f);
+  if (f.stocks <= 0 && other) {
+    state.gameOver = true;
+    state.winner = other.key;
+    state.gameOverFrame = state.frame;
+  }
+}
+
+function respawnFighter(f) {
+  f.alive = true;
+  f.x = f.spawnX; f.y = f.spawnY; f.prevY = f.spawnY;
+  f.vx = 0; f.vy = 0;
+  f.facing = f.key === 'p1' ? 1 : -1;
+  f.grounded = true; f.standingOn = SURFACES[0];
+  f.hitstun = 0; f.hitFlash = 0; f.spin = 0; f.dropTimer = 0; f.jumpCut = false;
+  f.attackTimer = 0; f.attackCooldown = 0; f.attackHit = false;
+  f.invuln = CONFIG.RESPAWN_INVULN;
+  // Smash-style: damage % survives a KO. Change to `f.damage = 0` if preferred.
+  spawnRespawnPuff(f);
+}
+
+// --- per-fighter simulation tick -------------------------------------------
+function stepFighter(f) {
+  if (!f.alive) {
+    if (state.gameOver) return;                 // eliminated: stay off stage
+    f.respawnTimer--;
+    if (f.respawnTimer <= 0) respawnFighter(f);
+    return;
+  }
+
+  // timers
+  if (f.hitstun > 0) f.hitstun--;
+  if (f.hitFlash > 0) f.hitFlash--;
+  if (f.invuln > 0) f.invuln--;
+  if (f.dropTimer > 0) f.dropTimer--;
+  if (f.attackCooldown > 0) f.attackCooldown--;
+  if (f.attackTimer > 0) {
+    f.attackTimer--;
+    if (f.attackTimer === 0) {
+      f.attackHit = false;
+      f.attackCooldown = CONFIG.ATTACK_COOLDOWN;   // swing finished -> cooldown
+    }
+  }
+
+  const it = f.intent;
+  const canAct = f.hitstun <= 0;
+
+  // facing
+  if (canAct) {
+    if (it.left && !it.right) f.facing = -1;
+    else if (it.right && !it.left) f.facing = 1;
+  }
+
+  // horizontal movement
+  if (canAct) {
+    const moveDir = (it.right ? 1 : 0) - (it.left ? 1 : 0);
+    const accel = f.grounded ? CONFIG.MOVE_ACCEL : CONFIG.AIR_ACCEL;
+
+    if (Math.abs(f.vx) > CONFIG.MAX_RUN) {
+      f.vx *= CONFIG.EXCESS_DRAG;                  // shedding knockback speed
+    } else if (moveDir !== 0) {
+      f.vx += moveDir * accel;
+      f.vx = clamp(f.vx, -CONFIG.MAX_RUN, CONFIG.MAX_RUN);
+    } else {
+      f.vx *= f.grounded ? CONFIG.GROUND_FRICTION : CONFIG.AIR_DRAG;
+      if (f.grounded && Math.abs(f.vx) < 0.12) f.vx = 0;
+    }
+
+    // jump (only when grounded) + variable height
+    if (it.jumpPressed) doJump(f);
+    if (!it.jumpHeld && f.vy < 0 && !f.jumpCut) { f.vy *= CONFIG.JUMP_CUT; f.jumpCut = true; }
+    if (f.vy >= 0) f.jumpCut = false;
+
+    // drop through one-way platform
+    if (it.downPressed) startDropThrough(f);
+
+    // attack (edge press, or hold if autorepeat is on)
+    if (it.attackPressed || (CONFIG.ATTACK_AUTOREPEAT && it.attackHeld)) tryAttack(f);
+  } else {
+    f.vx *= CONFIG.LAUNCH_DRAG;                    // launched: keep flying, slow decay
+  }
+
+  // gravity + integrate
+  applyGravity(f);
+  f.prevY = f.y;
+  f.x += f.vx;
+  f.y += f.vy;
+
+  // Self-driven movement stays inside the visible stage; knockback (hitstun)
+  // is what carries a fighter off screen for a KO.
+  if (f.hitstun <= 0) f.x = clamp(f.x, CONFIG.STAGE_CLAMP.left, CONFIG.STAGE_CLAMP.right);
+
+  // collision
+  const wasGrounded = f.grounded;
+  const fallSpeed = f.vy;
+  resolveSurfaceCollision(f);
+
+  if (!wasGrounded && f.grounded) {                // just landed
+    if (fallSpeed > 6) spawnDust(f.x, f.y, 5, 'rgba(200,215,255,0.35)');
+    if (f.hitstun > 0) f.hitstun = Math.min(f.hitstun, 12);  // landing ends the tumble sooner
+  }
+
+  // ground contact kills the tumble spin; airborne knockback spins the body
+  if (f.grounded) f.spin *= 0.7;
+  else if (f.hitstun > 0) f.spin += (f.vx >= 0 ? 1 : -1) * 0.16;
+  if (Math.abs(f.spin) > TAU) f.spin = Math.sign(f.spin) * (Math.abs(f.spin) % TAU);
+
+  // running dust
+  if (f.grounded && Math.abs(f.vx) > CONFIG.MAX_RUN * 0.75 && state.frame % 7 === 0) {
+    spawnDust(f.x - Math.sign(f.vx) * 6, f.y, 1, 'rgba(190,205,240,0.25)');
+  }
+
+  // animation clock
+  f.animTime += 1;
+  f.wasAirborne = !f.grounded;
+}
+
+// Attack resolution pass: one hit per swing, invulnerability respected.
+function resolveHits() {
+  const a = fighters[0], b = fighters[1];
+  checkAttack(a, b);
+  checkAttack(b, a);
+}
+
+function checkAttack(attacker, defender) {
+  if (attacker.attackTimer <= 0 || attacker.attackHit) return;
+  if (!defender.alive || defender.invuln > 0) return;
+  const hitbox = getHitbox(attacker);
+  if (!hitbox) return;
+  if (rectsOverlap(hitbox, getHurtbox(defender))) {
+    attacker.attackHit = true;
+    applyHit(attacker, defender, hitbox);
+  }
+}
+
+// Off-screen check => lose a stock. After the bell (game over) an airborne
+// survivor is simply walked back on stage instead of burning another stock.
+function checkBlastZones(f) {
+  if (!f.alive) return;
+  const b = CONFIG.BLAST;
+  const out = f.x < b.left || f.x > b.right || f.y < b.top || f.y > b.bottom;
+  if (!out) return;
+  if (state.gameOver) respawnFighter(f);
+  else killFighter(f);
+}
+
+// ==== RENDER ====
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let bgGradient = null;
+function makeBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, CONFIG.HEIGHT);
+  g.addColorStop(0.00, '#191d2c');
+  g.addColorStop(0.45, '#10131f');
+  g.addColorStop(1.00, '#06070c');
+  bgGradient = g;
+}
+
+function drawBackground() {
+  if (!bgGradient) makeBackground();
+  ctx.fillStyle = bgGradient;
+  ctx.fillRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT);
+
+  // subtle vignette + a faint glow sitting on the ground line
+  const v = ctx.createRadialGradient(
+    CONFIG.WIDTH / 2, CONFIG.HEIGHT * 0.55, 80,
+    CONFIG.WIDTH / 2, CONFIG.HEIGHT * 0.55, CONFIG.WIDTH * 0.72
+  );
+  v.addColorStop(0, 'rgba(0,0,0,0)');
+  v.addColorStop(1, 'rgba(0,0,0,0.55)');
+  ctx.fillStyle = v;
+  ctx.fillRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT);
+
+  const gl = ctx.createLinearGradient(0, CONFIG.GROUND_Y - 120, 0, CONFIG.GROUND_Y);
+  gl.addColorStop(0, 'rgba(120,150,255,0)');
+  gl.addColorStop(1, 'rgba(120,150,255,0.06)');
+  ctx.fillStyle = gl;
+  ctx.fillRect(0, CONFIG.GROUND_Y - 120, CONFIG.WIDTH, 120);
+}
+
+function drawStage() {
+  // --- floating one-way platforms ---
+  for (const p of PLATFORMS) {
+    const w = p.x2 - p.x1, h = 10;
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.6)';
+    ctx.shadowBlur = 12;
+    ctx.shadowOffsetY = 4;
+    const g = ctx.createLinearGradient(0, p.y, 0, p.y + h);
+    g.addColorStop(0, '#3b4360');
+    g.addColorStop(1, '#1b2033');
+    ctx.fillStyle = g;
+    roundRect(ctx, p.x1, p.y, w, h, 5);
+    ctx.fill();
+    ctx.restore();
+
+    ctx.strokeStyle = 'rgba(150,175,255,0.55)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(p.x1 + 4, p.y + 1);
+    ctx.lineTo(p.x2 - 4, p.y + 1);
+    ctx.stroke();
+  }
+
+  // --- flat ground line (solid) ---
+  const g = CONFIG.GROUND_Y;
+  ctx.save();
+  ctx.shadowColor = 'rgba(120,150,255,0.45)';
+  ctx.shadowBlur = 14;
+  ctx.strokeStyle = '#8fa6e8';
+  ctx.lineWidth = 4;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(CONFIG.GROUND_X1, g);
+  ctx.lineTo(CONFIG.GROUND_X2, g);
+  ctx.stroke();
+  ctx.restore();
+
+  // ground body hint below the line
+  const body = ctx.createLinearGradient(0, g, 0, CONFIG.HEIGHT);
+  body.addColorStop(0, 'rgba(90,110,180,0.16)');
+  body.addColorStop(1, 'rgba(20,25,45,0)');
+  ctx.fillStyle = body;
+  ctx.fillRect(CONFIG.GROUND_X1, g, CONFIG.GROUND_X2 - CONFIG.GROUND_X1, CONFIG.HEIGHT - g);
+
+  // blast-zone warning stripes at both screen edges
+  ctx.save();
+  ctx.globalAlpha = 0.16;
+  ctx.strokeStyle = '#ff5a6e';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 10]);
+  ctx.beginPath();
+  ctx.moveTo(3, 0); ctx.lineTo(3, CONFIG.HEIGHT);
+  ctx.moveTo(CONFIG.WIDTH - 3, 0); ctx.lineTo(CONFIG.WIDTH - 3, CONFIG.HEIGHT);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+function roundRect(c, x, y, w, h, r) {
+  const rr = Math.min(r, Math.abs(w) / 2, Math.abs(h) / 2);
+  c.beginPath();
+  c.moveTo(x + rr, y);
+  c.lineTo(x + w - rr, y);
+  c.quadraticCurveTo(x + w, y, x + w, y + rr);
+  c.lineTo(x + w, y + h - rr);
+  c.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+  c.lineTo(x + rr, y + h);
+  c.quadraticCurveTo(x, y + h, x, y + h - rr);
+  c.lineTo(x, y + rr);
+  c.quadraticCurveTo(x, y, x + rr, y);
+  c.closePath();
+}
+
+// --- procedural pose --------------------------------------------------------
+// Local space: origin at the feet, +x = facing direction, -y = up.
+// Everything is computed from state — no sprites, no keyframe data.
+function computePose(f) {
+  const t = f.animTime;
+  const speed = Math.abs(f.vx);
+  const launched = f.hitstun > 0;
+  const attacking = f.attackTimer > 0;
+  const airborne = !f.grounded;
+
+  const pose = {
+    lean: 0,
+    bob: 0,
+    hip: { x: 0, y: -30 },
+    shoulder: { x: 0, y: -52 },
+    head: { x: 0, y: -63, r: CONFIG.BODY.headR },
+    legs: [
+      { knee: { x: 4, y: -15 }, foot: { x: 5, y: 0 } },     // [0] front leg
+      { knee: { x: -4, y: -15 }, foot: { x: -5, y: 0 } }    // [1] back leg
+    ],
+    arms: [
+      { elbow: { x: 3, y: -42 }, hand: { x: 4, y: -33 } },  // [0] front arm
+      { elbow: { x: -3, y: -42 }, hand: { x: -4, y: -33 } } // [1] back arm
+    ]
+  };
+
+  if (launched) {
+    // HIT: body recoils backward, limbs sprawl
+    pose.lean = -8;
+    pose.bob = 0;
+    pose.hip.y = -29;
+    pose.legs[0] = { knee: { x: 6, y: -18 }, foot: { x: 11, y: -10 } };
+    pose.legs[1] = { knee: { x: -3, y: -16 }, foot: { x: -7, y: -15 } };
+    pose.arms[0] = { elbow: { x: -1, y: -46 }, hand: { x: -7, y: -55 } };
+    pose.arms[1] = { elbow: { x: -6, y: -44 }, hand: { x: -14, y: -51 } };
+  } else if (attacking) {
+    // ATTACK: front arm snaps out, back arm cocks, legs lunge
+    const prog = 1 - f.attackTimer / CONFIG.ATTACK_ACTIVE;            // 0 -> 1
+    // snap out on frame 1 (the hitbox is already live), then retract
+    const e = prog < 0.34 ? 1 : clamp(1 - ((prog - 0.34) / 0.66) * 0.85, 0, 1);
+    pose.lean = 3 + e * 2;
+    pose.hip.y = -29;
+    pose.arms[0] = { elbow: { x: 6 + e * 9, y: -48 }, hand: { x: 8 + e * 30, y: -46 } };
+    pose.arms[1] = { elbow: { x: -5, y: -45 }, hand: { x: -9, y: -37 } };
+    pose.legs[0] = { knee: { x: 7, y: -15 }, foot: { x: 11 + e * 3, y: 0 } };
+    pose.legs[1] = { knee: { x: -6, y: -15 }, foot: { x: -11, y: 0 } };
+  } else if (airborne) {
+    // JUMP / FALL: legs tucked, arms slightly out
+    const rising = f.vy < 0;
+    pose.lean = rising ? 1 : 3;
+    pose.hip.y = rising ? -31 : -29;
+    if (rising) {
+      pose.legs[0] = { knee: { x: 8, y: -20 }, foot: { x: 11, y: -11 } };
+      pose.legs[1] = { knee: { x: -4, y: -19 }, foot: { x: -8, y: -8 } };
+    } else {
+      pose.legs[0] = { knee: { x: 7, y: -17 }, foot: { x: 10, y: -5 } };
+      pose.legs[1] = { knee: { x: -5, y: -17 }, foot: { x: -9, y: -3 } };
+    }
+    pose.arms[0] = { elbow: { x: 7, y: -47 }, hand: { x: 13, y: -40 } };
+    pose.arms[1] = { elbow: { x: -7, y: -47 }, hand: { x: -13, y: -40 } };
+  } else if (speed > 0.55) {
+    // WALK / RUN: legs alternate stride, arms counter-swing
+    const pace = 0.20 + 0.14 * clamp(speed / CONFIG.MAX_RUN, 0, 1);
+    const p = t * pace;
+    const stride = 6 + 7 * clamp(speed / CONFIG.MAX_RUN, 0, 1);
+    pose.lean = 2 + clamp(speed / CONFIG.MAX_RUN, 0, 1) * 2;
+    pose.bob = -Math.abs(Math.cos(p)) * 1.6;
+    for (let i = 0; i < 2; i++) {
+      const th = p + i * Math.PI;
+      const s = Math.sin(th);
+      pose.legs[i] = {
+        knee: { x: s * stride * 0.55 + 2, y: -15 - Math.max(0, s) * 2 },
+        foot: { x: s * stride, y: -Math.max(0, s) * 5 }
+      };
+    }
+    pose.arms[0] = { elbow: { x: 2 - Math.sin(p) * 4, y: -43 }, hand: { x: 3 - Math.sin(p) * 9, y: -34 } };
+    pose.arms[1] = { elbow: { x: -2 + Math.sin(p) * 4, y: -43 }, hand: { x: -3 + Math.sin(p) * 9, y: -34 } };
+  } else {
+    // IDLE: subtle vertical bob + breathing sway
+    const b = Math.sin(t * 0.085);
+    pose.bob = b * 1.7;
+    const sway = b * 1.2;
+    pose.arms[0] = { elbow: { x: 3, y: -42 + pose.bob }, hand: { x: 4 + sway, y: -33 + pose.bob } };
+    pose.arms[1] = { elbow: { x: -3, y: -42 + pose.bob }, hand: { x: -4 - sway, y: -33 + pose.bob } };
+  }
+
+  // bake lean + bob into the upper body
+  pose.hip.y += pose.bob;
+  pose.shoulder.x += pose.lean;
+  pose.shoulder.y += pose.bob * 0.8;
+  pose.head.x += pose.lean * 1.35;
+  pose.head.y += pose.bob * 0.8;
+
+  // uniform body scale: one number retunes the whole fighter
+  const S = CONFIG.SCALE;
+  for (const j of [pose.hip, pose.shoulder, pose.head, pose.legs[0].knee, pose.legs[0].foot,
+    pose.legs[1].knee, pose.legs[1].foot, pose.arms[0].elbow, pose.arms[0].hand,
+    pose.arms[1].elbow, pose.arms[1].hand]) { j.x *= S; j.y *= S; }
+  pose.head.r *= S;
+
+  return pose;
+}
+
+function strokeLimb(c, a, b, d, width, color) {
+  c.strokeStyle = color;
+  c.lineWidth = width;
+  c.beginPath();
+  c.moveTo(a.x, a.y);
+  c.lineTo(b.x, b.y);
+  c.lineTo(d.x, d.y);
+  c.stroke();
+}
+
+function drawFighter(f) {
+  if (!f.alive) return;                                   // off screen / respawning
+  // respawn invulnerability: blink
+  const blink = f.invuln > 0 && Math.floor(f.invuln / 4) % 2 === 0;
+  const pose = computePose(f);
+  const white = f.hitFlash > 0 && (f.hitFlash > CONFIG.HIT_FLASH - 3 || f.hitFlash % 2 === 1);
+  const main = white ? '#ffffff' : f.colors.main;
+  const dark = white ? '#f2f2f2' : f.colors.dark;
+  const B = CONFIG.BODY;
+
+  ctx.save();
+  ctx.translate(f.x, f.y);
+  if (pose.spin) {                                        // KO tumble
+    ctx.translate(0, -32 * CONFIG.SCALE);
+    ctx.rotate(pose.spin);
+    ctx.translate(0, 32 * CONFIG.SCALE);
+  }
+  ctx.scale(f.facing, 1);                                 // draw facing +x
+  ctx.globalAlpha = blink ? 0.35 : 1;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.shadowColor = white ? 'rgba(255,255,255,0.9)' : f.colors.glow;
+  ctx.shadowBlur = white ? 18 : 9;
+
+  // back limbs (darker, drawn first for depth)
+  strokeLimb(ctx, pose.hip, pose.legs[1].knee, pose.legs[1].foot, B.legW, dark);
+  strokeLimb(ctx, pose.shoulder, pose.arms[1].elbow, pose.arms[1].hand, B.armW, dark);
+
+  // torso (thick)
+  ctx.strokeStyle = main;
+  ctx.lineWidth = B.torsoW;
+  ctx.beginPath();
+  ctx.moveTo(pose.hip.x, pose.hip.y);
+  ctx.lineTo(pose.shoulder.x, pose.shoulder.y);
+  ctx.stroke();
+
+  // head (circle)
+  ctx.lineWidth = B.headW;
+  ctx.beginPath();
+  ctx.arc(pose.head.x, pose.head.y, pose.head.r, 0, TAU);
+  ctx.stroke();
+
+  // front limbs (on top)
+  strokeLimb(ctx, pose.hip, pose.legs[0].knee, pose.legs[0].foot, B.legW, main);
+  strokeLimb(ctx, pose.shoulder, pose.arms[0].elbow, pose.arms[0].hand, B.armW, main);
+
+  ctx.restore();
+
+  // debug: attack hitbox (uncomment during tuning)
+  // const hb = getHitbox(f); if (hb) { ctx.strokeStyle='rgba(255,255,0,.6)'; ctx.strokeRect(hb.x,hb.y,hb.w,hb.h); }
+
+  drawFighterOverlay(f);
+}
+
+// Small health bar + damage % floating above each fighter.
+function drawFighterOverlay(f) {
+  const bar = CONFIG.HEALTH_BAR;
+  const tier = damageTier(f.damage);
+  const w = bar.width, h = bar.height;
+  const x = Math.round(f.x - w / 2);
+  const y = Math.round(f.y - bar.offsetY * CONFIG.SCALE);
+  const fill = clamp(1 - f.damage / bar.max, 0, 1);
+
+  ctx.save();
+  ctx.shadowBlur = 0;
+  ctx.globalAlpha = f.invuln > 0 && Math.floor(f.invuln / 4) % 2 === 0 ? 0.4 : 1;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  roundRect(ctx, x - 1, y - 1, w + 2, h + 2, 3);
+  ctx.fill();
+
+  ctx.fillStyle = tier.bar;
+  if (fill > 0) {
+    roundRect(ctx, x, y, Math.max(2, w * fill), h, 2);
+    ctx.fill();
+  }
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 1;
+  roundRect(ctx, x - 1, y - 1, w + 2, h + 2, 3);
+  ctx.stroke();
+
+  ctx.font = `bold 12px ${CONFIG.FONT}`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = tier.text;
+  ctx.fillText(`${Math.floor(f.damage)}%`, f.x, y - 6);
+  ctx.restore();
+}
+
+function damageTier(damage) {
+  for (const t of CONFIG.DAMAGE_TIERS) if (damage < t.at) return t;
+  return CONFIG.DAMAGE_TIERS[CONFIG.DAMAGE_TIERS.length - 1];
+}
+
+// --- particles --------------------------------------------------------------
+function spawnParticle(x, y, vx, vy, life, color, size, gravity) {
+  particles.push({ x, y, vx, vy, life, maxLife: life, color, size, gravity: gravity || 0 });
+}
+
+function spawnHitSparks(x, y, dir, kb, color) {
+  const n = 8 + Math.round(kb);
+  for (let i = 0; i < n; i++) {
+    const a = (Math.random() - 0.5) * 1.7 + (dir > 0 ? 0 : Math.PI);
+    const sp = 2 + Math.random() * (2 + kb * 0.28);
+    spawnParticle(x, y, Math.cos(a) * sp, Math.sin(a) * sp - 1, 14 + Math.random() * 14,
+      Math.random() < 0.45 ? '#ffffff' : color, 1.5 + Math.random() * 2.5, 0.16);
+  }
+  // impact ring
+  particles.push({ x, y, vx: 0, vy: 0, life: 9, maxLife: 9, color: '#ffffff', size: 4, ring: true, gravity: 0 });
+}
+
+function spawnDust(x, y, n, color) {
+  for (let i = 0; i < n; i++) {
+    spawnParticle(x + (Math.random() - 0.5) * 14, y,
+      (Math.random() - 0.5) * 1.8, -Math.random() * 1.2,
+      12 + Math.random() * 12, color, 1.5 + Math.random() * 2, 0.02);
+  }
+}
+
+function spawnKoBurst(f) {
+  const x = clamp(f.x, 8, CONFIG.WIDTH - 8);
+  const y = clamp(f.y - 34, 8, CONFIG.HEIGHT - 8);
+  for (let i = 0; i < 34; i++) {
+    const a = Math.random() * TAU;
+    const sp = 2 + Math.random() * 7;
+    spawnParticle(x, y, Math.cos(a) * sp, Math.sin(a) * sp, 22 + Math.random() * 26,
+      Math.random() < 0.5 ? '#ffffff' : f.colors.main, 1.5 + Math.random() * 3, 0.12);
+  }
+  particles.push({ x, y, vx: 0, vy: 0, life: 18, maxLife: 18, color: f.colors.main, size: 8, ring: true, gravity: 0 });
+}
+
+function spawnRespawnPuff(f) {
+  for (let i = 0; i < 16; i++) {
+    const a = Math.random() * TAU;
+    spawnParticle(f.x, f.y - 30, Math.cos(a) * 2.2, Math.sin(a) * 2.2, 16 + Math.random() * 10,
+      f.colors.main, 1.5 + Math.random() * 2, 0);
+  }
+}
+
+function updateParticles() {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life--;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += p.gravity;
+    p.vx *= 0.97;
+    if (p.ring) p.size += 3.2;
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const a = clamp(p.life / p.maxLife, 0, 1);
+    ctx.globalAlpha = a;
+    if (p.ring) {
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = 2 * a + 0.5;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size * (1.6 - a), 0, TAU);
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size * (0.4 + a * 0.6), 0, TAU);
+      ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT);
+
+  drawBackground();
+
+  ctx.save();
+  if (state.shake > 0.4) {
+    ctx.translate((Math.random() - 0.5) * state.shake, (Math.random() - 0.5) * state.shake);
+  }
+  drawStage();
+  // draw the fighter further back first so overlaps read correctly
+  const order = fighters.slice().sort((a, b) => (a.hitstun > 0 ? 1 : 0) - (b.hitstun > 0 ? 1 : 0));
+  for (const f of order) drawFighter(f);
+  drawParticles();
+  ctx.restore();
+
+  drawUI();
+}
+
+// ==== GAME LOOP ====
+const state = {
+  frame: 0,
+  shake: 0,
+  freeze: 0,          // hitstop frames
+  gameOver: false,
+  winner: null,
+  gameOverFrame: 0
+};
+
+const particles = [];
+const fighters = [
+  createFighter('p1', CONTROLS.p1, SPAWNS.p1, CONFIG.COLORS.p1),
+  createFighter('p2', CONTROLS.p2, SPAWNS.p2, CONFIG.COLORS.p2)
+];
+fighters[0].hitsLanded = 0;
+fighters[1].hitsLanded = 0;
+
+function resetGame() {
+  state.frame = 0;
+  state.shake = 0;
+  state.freeze = 0;
+  state.gameOver = false;
+  state.winner = null;
+  state.gameOverFrame = 0;
+  particles.length = 0;
+  for (const f of fighters) { resetFighter(f); f.hitsLanded = 0; }
+  Input.endFrame();
+  // release every held key so a restart never inherits stuck input
+  for (const code of Object.keys(Input.down)) Input.set(code, false);
+}
+
+// One simulation tick (1/60s of game time).
+function update() {
+  state.frame++;
+
+  if (Input.wasPressed(RESTART_KEY)) resetGame();
+
+  // hitstop: freeze the fighters for a couple of frames on impact
+  if (state.freeze > 0) {
+    state.freeze--;
+    updateParticles();
+    return;
+  }
+
+  const live = !state.gameOver;
+  const NO_INTENT = {
+    left: false, right: false, jumpPressed: false, jumpHeld: false,
+    downPressed: false, attackPressed: false, attackHeld: false
+  };
+  for (const f of fighters) f.intent = live ? readIntent(f.controls) : NO_INTENT;
+
+  for (const f of fighters) {
+    if (!live && f.stocks <= 0) continue;       // eliminated fighter stays out
+    stepFighter(f);
+  }
+  if (live) resolveHits();
+  for (const f of fighters) checkBlastZones(f);
+
+  updateParticles();
+  if (state.shake > 0) state.shake *= 0.86;
+
+  Input.endFrame();
+}
+
+// Fixed-timestep pump: the "frames" in CONFIG are always 60Hz regardless of display.
+const STEP_MS = 1000 / 60;
+let accumulator = 0;
+let lastTime = 0;
+let rafId = 0;
+
+function loop(now) {
+  rafId = requestAnimationFrame(loop);
+  if (!lastTime) lastTime = now;
+  accumulator += Math.min(now - lastTime, 200);   // clamp after tab-switch stalls
+  lastTime = now;
+
+  let ticks = 0;
+  while (accumulator >= STEP_MS && ticks < 5) {
+    update();
+    accumulator -= STEP_MS;
+    ticks++;
+  }
+  if (ticks === 5) accumulator = 0;               // drop the backlog
+
+  render();
+}
+
+function start() {
+  Input.init();
+  makeBackground();
+  resetGame();
+  rafId = requestAnimationFrame(loop);
+}
+
+// ==== UI ====
+function drawUI() {
+  drawStockPanel(fighters[0], 'left');
+  drawStockPanel(fighters[1], 'right');
+  drawHints();
+  if (state.gameOver) drawGameOver();
+}
+
+function drawStockPanel(f, side) {
+  const W = 196, H = 58, M = 16;
+  const x = side === 'left' ? M : CONFIG.WIDTH - M - W;
+  const y = 14;
+  const tier = damageTier(f.damage);
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(8,10,18,0.62)';
+  roundRect(ctx, x, y, W, H, 10);
+  ctx.fill();
+  ctx.strokeStyle = f.colors.main;
+  ctx.globalAlpha = 0.55;
+  ctx.lineWidth = 2;
+  roundRect(ctx, x + 1, y + 1, W - 2, H - 2, 9);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  const innerLeft = side === 'left' ? x + 14 : x + W - 14;
+  const dir = side === 'left' ? 1 : -1;
+
+  // name
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = side === 'left' ? 'left' : 'right';
+  ctx.font = `bold 16px ${CONFIG.FONT}`;
+  ctx.fillStyle = f.colors.main;
+  ctx.fillText(f.colors.name, innerLeft, y + 22);
+
+  // stock pips
+  const pipR = 5.5, gap = 16;
+  const pipStart = innerLeft + dir * 4;
+  for (let i = 0; i < CONFIG.STOCKS; i++) {
+    const px = pipStart + dir * (i * gap);
+    const py = y + 40;
+    ctx.beginPath();
+    ctx.arc(px, py, pipR, 0, TAU);
+    if (i < f.stocks) {
+      ctx.fillStyle = f.colors.main;
+      ctx.fill();
+    } else {
+      ctx.strokeStyle = 'rgba(255,255,255,0.28)';
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+    }
+  }
+
+  // damage %
+  ctx.textAlign = side === 'left' ? 'right' : 'left';
+  ctx.font = `bold 30px ${CONFIG.FONT}`;
+  ctx.fillStyle = f.stocks > 0 ? tier.text : 'rgba(255,255,255,0.35)';
+  const dmgX = side === 'left' ? x + W - 14 : x + 14;
+  ctx.fillText(`${Math.floor(f.damage)}%`, dmgX, y + 42);
+  ctx.font = `10px ${CONFIG.FONT}`;
+  ctx.fillStyle = 'rgba(255,255,255,0.4)';
+  ctx.fillText('DAMAGE', dmgX, y + 53);
+  ctx.restore();
+}
+
+function drawHints() {
+  ctx.save();
+  ctx.textBaseline = 'alphabetic';
+
+  // center-bottom restart hint
+  ctx.textAlign = 'center';
+  ctx.font = `13px ${CONFIG.FONT}`;
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  const pulse = 0.35 + 0.2 * Math.sin(state.frame * 0.06);
+  ctx.globalAlpha = state.gameOver ? 0 : clamp(pulse + 0.25, 0, 1);
+  ctx.fillText('Press R to restart', CONFIG.WIDTH / 2, CONFIG.HEIGHT - 18);
+  ctx.globalAlpha = 1;
+
+  // control legend in the bottom corners
+  ctx.font = `11px ${CONFIG.FONT}`;
+  ctx.fillStyle = 'rgba(255,120,135,0.55)';
+  ctx.textAlign = 'left';
+  ctx.fillText('P1   A / D move   W jump   S drop   F attack', 18, CONFIG.HEIGHT - 18);
+  ctx.fillStyle = 'rgba(120,180,255,0.55)';
+  ctx.textAlign = 'right';
+  ctx.fillText('P2   \u2190 / \u2192 move   \u2191 jump   \u2193 drop   / attack', CONFIG.WIDTH - 18, CONFIG.HEIGHT - 18);
+  ctx.restore();
+}
+
+function drawGameOver() {
+  const winner = fighters.find((f) => f.key === state.winner) || fighters[0];
+  const since = state.frame - state.gameOverFrame;
+  const pop = clamp(since / 18, 0, 1);
+  const scale = 0.7 + 0.3 * (1 - Math.pow(1 - pop, 3));
+
+  ctx.save();
+  ctx.fillStyle = `rgba(3,4,8,${0.62 * pop})`;
+  ctx.fillRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT);
+
+  ctx.translate(CONFIG.WIDTH / 2, CONFIG.HEIGHT / 2 - 10);
+  ctx.scale(scale, scale);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  ctx.shadowColor = winner.colors.glow;
+  ctx.shadowBlur = 28;
+  ctx.font = `900 82px ${CONFIG.FONT}`;
+  ctx.fillStyle = winner.colors.main;
+  ctx.fillText(`${winner.colors.name} WINS`, 0, 0);
+
+  ctx.shadowBlur = 0;
+  ctx.font = `18px ${CONFIG.FONT}`;
+  ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  ctx.fillText('Press R to restart', 0, 62);
+  ctx.restore();
+}
+
+// ==== DEBUG HOOK ====
+// Exposes the simulation so automated tests (and later a Node server relaying
+// phone controllers) can drive and inspect the game. Delete for production.
+window.STICKFIGHT = {
+  CONFIG, SURFACES, PLATFORMS, CONTROLS, SPAWNS,
+  state, fighters, particles,
+  Input, readIntent,
+  update, render, resetGame, start,
+  stepFighter, resolveHits, tryAttack, applyHit, killFighter, respawnFighter,
+  getHitbox, getHurtbox, rectsOverlap, knockbackFor, computePose
+};
+
+start();
+</script>
+</body>
+</html>
